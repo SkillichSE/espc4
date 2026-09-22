@@ -42,7 +42,10 @@ const char DEFUSE_KEY = '#';
 const char ERASE_KEY  = '*';
 const String ARM_CODE = "7355608";
 
-enum class BombState { BOMB_IDLE, BOMB_ARMED, BOMB_DEFUSED, BOMB_EXPLODED };
+enum class BombState {
+  BOMB_IDLE, BOMB_ARMED, BOMB_DEFUSED, BOMB_EXPLODED,
+  MENU, MODE_CLOCK, MODE_TIMER_SET, MODE_TIMER, MODE_STOPWATCH
+};
 BombState state = BombState::BOMB_IDLE;
 
 unsigned long armedAt = 0;
@@ -55,6 +58,18 @@ unsigned long lastAcceptedKeyAt = 0;
 
 unsigned long defuseHoldStart = 0;
 bool defuseHolding = false;
+
+long clockOffsetSeconds = 0;
+unsigned long clockStartedAt = 0;
+
+unsigned long timerDurationMs = 0;
+unsigned long timerStartedAt = 0;
+bool timerRunning = false;
+bool timerFinished = false;
+
+unsigned long stopwatchStartedAt = 0;
+unsigned long stopwatchElapsedMs = 0;
+bool stopwatchRunning = false;
 
 void showIdleScreen();
 void handleIdle(char key);
@@ -71,6 +86,25 @@ void debugPrintPressedKeys();
 void lcdPrintLine(uint8_t row, const String &text);
 char getFreshPressedKey();
 String buildCodeMask();
+bool isAllZeros(const String &code);
+
+void openMenu();
+void showMenuScreen();
+void handleMenu(char key);
+
+void enterClockMode();
+void updateClockScreen();
+void handleClock(char key);
+
+void enterTimerSetMode();
+void showTimerSetScreen();
+void handleTimerSet(char key);
+void updateTimerScreen(unsigned long remainingMs);
+void handleTimer(char key);
+
+void enterStopwatchMode();
+void updateStopwatchScreen(bool force);
+void handleStopwatch(char key);
 
 void setup() {
   Serial.begin(115200);
@@ -163,6 +197,21 @@ void loop() {
     case BombState::BOMB_EXPLODED:
       handleExploded(freshKey);
       break;
+    case BombState::MENU:
+      handleMenu(freshKey);
+      break;
+    case BombState::MODE_CLOCK:
+      handleClock(freshKey);
+      break;
+    case BombState::MODE_TIMER_SET:
+      handleTimerSet(freshKey);
+      break;
+    case BombState::MODE_TIMER:
+      handleTimer(freshKey);
+      break;
+    case BombState::MODE_STOPWATCH:
+      handleStopwatch(freshKey);
+      break;
   }
 }
 
@@ -186,6 +235,14 @@ String buildCodeMask() {
     }
   }
   return mask;
+}
+
+bool isAllZeros(const String &code) {
+  if (code.length() == 0) return false;
+  for (int i = 0; i < (int)code.length(); i++) {
+    if (code[i] != '0') return false;
+  }
+  return true;
 }
 
 void showIdleScreen() {
@@ -215,6 +272,9 @@ void handleIdle(char key) {
     if (enteredArmCode.length() == ARM_CODE.length()) {
       if (enteredArmCode == ARM_CODE) {
         armBomb();
+        return;
+      } else if (isAllZeros(enteredArmCode)) {
+        openMenu();
         return;
       } else {
         enteredArmCode = "";
@@ -363,5 +423,256 @@ void handleExploded(char key) {
     enteredArmCode = "";
     lastAcceptedKey = 0;
     showIdleScreen();
+  }
+}
+
+
+void openMenu() {
+  enteredArmCode = "";
+  state = BombState::MENU;
+  tone(BUZZER_PIN, 1200, 100);
+  showMenuScreen();
+}
+
+void showMenuScreen() {
+  lcdPrintLine(0, "1)Clock 2)Timer");
+  lcdPrintLine(1, "3)Stopwatch *Ex");
+}
+
+void handleMenu(char key) {
+  if (!key) return;
+
+  switch (key) {
+    case '1':
+      enterClockMode();
+      break;
+    case '2':
+      enterTimerSetMode();
+      break;
+    case '3':
+      enterStopwatchMode();
+      break;
+    case ERASE_KEY:
+      state = BombState::BOMB_IDLE;
+      enteredArmCode = "";
+      showIdleScreen();
+      break;
+    default:
+      break;
+  }
+}
+
+
+void enterClockMode() {
+  clockStartedAt = millis();
+  enteredArmCode = "";
+  state = BombState::MODE_CLOCK;
+  updateClockScreen();
+}
+
+void updateClockScreen() {
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw < 500) return;
+  lastDraw = millis();
+
+  unsigned long elapsedSec = (millis() - clockStartedAt) / 1000UL;
+  long totalSec = (clockOffsetSeconds + (long)elapsedSec) % 86400L;
+  if (totalSec < 0) totalSec += 86400L;
+
+  int hh = totalSec / 3600;
+  int mm = (totalSec % 3600) / 60;
+  int ss = totalSec % 60;
+
+  char line0[LCD_COLS + 1];
+  snprintf(line0, sizeof(line0), "CLOCK  %02d:%02d:%02d", hh, mm, ss);
+  lcdPrintLine(0, line0);
+
+  char line1[LCD_COLS + 1];
+  if (enteredArmCode.length() > 0) {
+    snprintf(line1, sizeof(line1), "Set HHMM:%-6s", enteredArmCode.c_str());
+  } else {
+    snprintf(line1, sizeof(line1), "#set  *menu");
+  }
+  lcdPrintLine(1, line1);
+}
+
+void handleClock(char key) {
+  updateClockScreen();
+  if (!key) return;
+
+  if (isDigit(key) && enteredArmCode.length() < 4) {
+    enteredArmCode += key;
+    tone(BUZZER_PIN, 1000, 30);
+    updateClockScreen();
+  } else if (key == DEFUSE_KEY) {
+    if (enteredArmCode.length() == 4) {
+      int hh = enteredArmCode.substring(0, 2).toInt();
+      int mm = enteredArmCode.substring(2, 4).toInt();
+      if (hh >= 0 && hh < 24 && mm >= 0 && mm < 60) {
+        clockOffsetSeconds = (long)hh * 3600L + (long)mm * 60L;
+        clockStartedAt = millis();
+        tone(BUZZER_PIN, 1500, 150);
+      }
+    }
+    enteredArmCode = "";
+    updateClockScreen();
+  } else if (key == ERASE_KEY) {
+    if (enteredArmCode.length() > 0) {
+      enteredArmCode.remove(enteredArmCode.length() - 1);
+      updateClockScreen();
+    } else {
+      state = BombState::MENU;
+      showMenuScreen();
+    }
+  }
+}
+
+
+void enterTimerSetMode() {
+  enteredArmCode = "";
+  state = BombState::MODE_TIMER_SET;
+  showTimerSetScreen();
+}
+
+void showTimerSetScreen() {
+  lcdPrintLine(0, "SET TIMER MMSS:");
+  char line1[LCD_COLS + 1];
+  snprintf(line1, sizeof(line1), "%-4s   #ok *back", enteredArmCode.c_str());
+  lcdPrintLine(1, line1);
+}
+
+void handleTimerSet(char key) {
+  if (!key) return;
+
+  if (isDigit(key) && enteredArmCode.length() < 4) {
+    enteredArmCode += key;
+    tone(BUZZER_PIN, 1000, 30);
+    showTimerSetScreen();
+  } else if (key == ERASE_KEY) {
+    if (enteredArmCode.length() > 0) {
+      enteredArmCode.remove(enteredArmCode.length() - 1);
+      showTimerSetScreen();
+    } else {
+      state = BombState::MENU;
+      showMenuScreen();
+    }
+  } else if (key == DEFUSE_KEY) {
+    if (enteredArmCode.length() > 0) {
+      String padded = enteredArmCode;
+      while (padded.length() < 4) padded = "0" + padded;
+      int mm = padded.substring(0, 2).toInt();
+      int ss = padded.substring(2, 4).toInt();
+      unsigned long totalSec = (unsigned long)mm * 60UL + (unsigned long)ss;
+      if (totalSec > 0) {
+        timerDurationMs = totalSec * 1000UL;
+        timerStartedAt = millis();
+        timerRunning = true;
+        timerFinished = false;
+        state = BombState::MODE_TIMER;
+        tone(BUZZER_PIN, 1500, 150);
+      }
+    }
+  }
+}
+
+void updateTimerScreen(unsigned long remainingMs) {
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw < 200) return;
+  lastDraw = millis();
+
+  int secLeft = (remainingMs + 999) / 1000;
+  int mm = secLeft / 60;
+  int ss = secLeft % 60;
+
+  char line0[LCD_COLS + 1];
+  snprintf(line0, sizeof(line0), "TIMER  %02d:%02d", mm, ss);
+  lcdPrintLine(0, line0);
+  lcdPrintLine(1, timerRunning ? "#pause  *menu" : "#resume *menu");
+}
+
+void handleTimer(char key) {
+  if (timerRunning && !timerFinished) {
+    unsigned long elapsed = millis() - timerStartedAt;
+    if (elapsed >= timerDurationMs) {
+      timerFinished = true;
+      timerRunning = false;
+      lcdPrintLine(0, "TIME'S UP!");
+      lcdPrintLine(1, "*menu");
+      tone(BUZZER_PIN, 2000, 500);
+    } else {
+      updateTimerScreen(timerDurationMs - elapsed);
+    }
+  }
+
+  if (!key) return;
+
+  if (key == DEFUSE_KEY && !timerFinished) {
+    if (timerRunning) {
+      unsigned long elapsed = millis() - timerStartedAt;
+      timerDurationMs = (elapsed < timerDurationMs) ? (timerDurationMs - elapsed) : 0;
+      timerRunning = false;
+    } else {
+      timerStartedAt = millis();
+      timerRunning = true;
+    }
+  } else if (key == ERASE_KEY) {
+    timerRunning = false;
+    state = BombState::MENU;
+    showMenuScreen();
+  }
+}
+
+
+void enterStopwatchMode() {
+  state = BombState::MODE_STOPWATCH;
+  stopwatchElapsedMs = 0;
+  stopwatchRunning = false;
+  updateStopwatchScreen(true);
+}
+
+void updateStopwatchScreen(bool force) {
+  static unsigned long lastDraw = 0;
+  if (!force && millis() - lastDraw < 100) return;
+  lastDraw = millis();
+
+  unsigned long totalMs = stopwatchElapsedMs;
+  if (stopwatchRunning) totalMs += millis() - stopwatchStartedAt;
+
+  unsigned long totalSec = totalMs / 1000UL;
+  int mm = totalSec / 60;
+  int ss = totalSec % 60;
+  int cs = (totalMs % 1000UL) / 10UL;
+
+  char line0[LCD_COLS + 1];
+  snprintf(line0, sizeof(line0), "STOPWATCH %02d:%02d", mm, ss);
+  lcdPrintLine(0, line0);
+
+  char line1[LCD_COLS + 1];
+  snprintf(line1, sizeof(line1), ".%02d #%s *rst", cs, stopwatchRunning ? "stop" : "run ");
+  lcdPrintLine(1, line1);
+}
+
+void handleStopwatch(char key) {
+  updateStopwatchScreen(false);
+  if (!key) return;
+
+  if (key == DEFUSE_KEY) {
+    if (stopwatchRunning) {
+      stopwatchElapsedMs += millis() - stopwatchStartedAt;
+      stopwatchRunning = false;
+    } else {
+      stopwatchStartedAt = millis();
+      stopwatchRunning = true;
+    }
+    updateStopwatchScreen(true);
+  } else if (key == ERASE_KEY) {
+    if (stopwatchRunning || stopwatchElapsedMs > 0) {
+      stopwatchRunning = false;
+      stopwatchElapsedMs = 0;
+      updateStopwatchScreen(true);
+    } else {
+      state = BombState::MENU;
+      showMenuScreen();
+    }
   }
 }
